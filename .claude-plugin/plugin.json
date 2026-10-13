@@ -1,0 +1,16 @@
+{
+  "name": "pitwall",
+  "version": "1.0.0",
+  "description": "F1-themed pit wall for Claude Code: prompt-cache countdown, context gauge with laps left, Handoff / Compact / Self commit / Radio check buttons, safety-car handoff before auto-compact, sounds and desktop notifications.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Pratheek J"
+  },
+  "keywords": [
+    "context",
+    "cache",
+    "handoff",
+    "compact",
+    "f1"
+  ]
+}

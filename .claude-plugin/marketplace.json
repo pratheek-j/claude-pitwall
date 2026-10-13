@@ -1,0 +1,14 @@
+{
+  "name": "pitwall",
+  "description": "Pitwall, an F1-themed pit wall for Claude Code sessions.",
+  "owner": {
+    "name": "Pratheek J"
+  },
+  "plugins": [
+    {
+      "name": "pitwall",
+      "source": "./",
+      "description": "F1-themed pit wall for Claude Code: prompt-cache countdown, context gauge with laps left, Handoff / Compact / Self commit / Radio check buttons, safety-car handoff before auto-compact, sounds and desktop notifications."
+    }
+  ]
+}
