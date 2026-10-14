@@ -43,6 +43,7 @@ declare module 'claude-code' {
       form: Form
       explained: Explained | null
       resumeNote: ResumeNote | null
+      isCompacting: boolean
     }
   }
 }

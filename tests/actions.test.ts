@@ -258,7 +258,30 @@ test('Every action button opens a confirm card first; Cancel runs nothing', asyn
   await ui.unmount()
 })
 
-test('A compact the host refuses says why and leaves /compact in the prompt box', async ($, on) => {
+test('Compact falls back to Claude Code\'s own /compact where the direct call is refused', async ($, on) => {
+  world(on, {})
+  const ran: string[] = []
+  const filled: string[] = []
+  on('command.run', ($, e) => {
+    ran.push(e.command)
+    return {}
+  })
+  on('prompt.fill', ($, e) => {
+    filled.push(e.text)
+    return { isFilled: true }
+  })
+  // Nothing beneath answers session.compact here, so the direct call is refused, as in the desktop app.
+
+  const ui = await $.ui.mount({ plugin: 'pitwall', surface: 'desktop', ...BAND })
+  await ui.press({ key: 'compact' })
+  await ui.press({ key: 'compact-go' })
+  await ui.unmount()
+
+  expect(ran).toEqual(['compact'])
+  expect(filled).toEqual([])
+})
+
+test('When every route is refused, Compact leaves /compact in the prompt box and says so', async ($, on) => {
   world(on, {})
   const filled: string[] = []
   const toasts: string[] = []
@@ -270,7 +293,6 @@ test('A compact the host refuses says why and leaves /compact in the prompt box'
     toasts.push(e.text)
     return { value: undefined }
   })
-  // Nothing beneath answers session.compact here, so the call rejects, as it does mid-turn.
 
   const ui = await $.ui.mount({ plugin: 'pitwall', surface: 'desktop', ...BAND })
   await ui.press({ key: 'compact' })
@@ -278,5 +300,41 @@ test('A compact the host refuses says why and leaves /compact in the prompt box'
   await ui.unmount()
 
   expect(filled).toEqual(['/compact'])
-  expect(toasts.some(t => t.startsWith("pitwall: couldn't compact from here") && t.includes('press Enter'))).toBe(true)
+  expect(toasts.some(t => t.includes('/compact is in the prompt box, press Enter') && !t.includes('pitwall: pitwall'))).toBe(true)
+})
+
+const SUMMARY = { role: 'user', text: 'Summary of the work so far.', toolUses: [] }
+
+test('While the conversation is compacting, every action button is locked', async ($, on) => {
+  world(on, {})
+  let finish: () => void = () => {}
+  on('session.compact', () => new Promise(done => {
+    finish = () => done({ messages: [SUMMARY], tokensBefore: 900_000, tokensAfter: 120_000 } as never)
+  }))
+  const toasts: string[] = []
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+
+  const ui = await $.ui.mount({ plugin: 'pitwall', surface: 'desktop', ...BAND })
+  // A compaction started elsewhere (a typed /compact) is in progress.
+  const compacting = $.session.compact({ messages: [SUMMARY] } as never)
+  const timer = (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => void }).setTimeout
+  await new Promise<void>(done => timer(done, 20))
+
+  expect(await ui.find({ type: 'Text', text: /In the pits: compacting the conversation/ })).toBeDefined()
+  for (const key of ['handoff', 'compact', 'self-commit', 'grill', 'eli5', 'awty']) {
+    expect((await ui.find({ key }))?.props.dimColor).toBe(true)
+    await ui.press({ key })
+  }
+  expect(await ui.findAll({ type: 'Button' }).then(all => all.filter(b => b.props.label === 'Cancel'))).toHaveLength(0)
+  expect(toasts.filter(t => t.includes("Compacting… the pitwall's back")).length).toBe(6)
+
+  finish()
+  await compacting
+  expect(await ui.find({ type: 'Text', text: /In the pits/ })).toBeUndefined()
+  expect((await ui.find({ key: 'handoff' }))?.props.dimColor).toBeFalsy()
+  expect(toasts.some(t => t.startsWith('🔧 Pit stop complete'))).toBe(true)
+  await ui.unmount()
 })

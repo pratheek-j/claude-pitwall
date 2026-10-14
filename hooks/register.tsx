@@ -30,6 +30,8 @@ const isNotifyOn = atom({ plugin: 'pitwall', key: 'isNotifyOn' } as const, true)
 const form = atom({ plugin: 'pitwall', key: 'form' } as const, null)
 const explained = atom({ plugin: 'pitwall', key: 'explained' } as const, null)
 const resumeNote = atom({ plugin: 'pitwall', key: 'resumeNote' } as const, null)
+// True while the main conversation is being compacted, however it was started.
+const isCompacting = atom({ plugin: 'pitwall', key: 'isCompacting' } as const, false)
 
 // Theme keys on the terminal follow the person's color theme; the SVG bars need hex.
 const THEME: Record<Level, string> = { ok: 'success', warn: 'warning', hot: 'error' }
@@ -456,6 +458,11 @@ const BUSY_TEXT: Record<Exclude<Busy, null>, string> = {
 }
 
 async function openForm($: Engine, which: Form) {
+  // Nothing opens while the conversation is in the pits.
+  if (which !== null && ((await read($, isCompacting)) || (await read($, busy)) === 'compact')) {
+    $.ui.toast("🔧 Compacting… the pitwall's back once it's done.")
+    return
+  }
   // pitwall runs one job at a time; Grill me runs in the chat, so it never waits.
   const doing = await read($, busy)
   if (doing !== null && which !== null && which !== 'grill') {
@@ -513,6 +520,15 @@ async function doAwty($: Engine): Promise<string> {
   }
 }
 
+// The reason an engine call gave, without the "pitwall: " the engine puts in front.
+const reason = (err: unknown) =>
+  String(err instanceof Error ? err.message : err)
+    .replace(/^(pitwall: )+/, '')
+    .slice(0, 200)
+
+// Compact asks the engine directly (a terminal session), else runs Claude Code's own
+// /compact (the desktop app and SDK, where compaction runs inside a turn), else leaves
+// /compact in the prompt box. The session.compact hook reports the result either way.
 async function doCompact($: Engine) {
   if (isRunning) {
     $.ui.toast('📻 Stay out, stay out. Box after this lap finishes.')
@@ -520,45 +536,28 @@ async function doCompact($: Engine) {
   }
   if ((await read($, busy)) !== null) return
   await update($, busy, (): Busy => 'compact')
-  const before = (await read($, context))?.percent
-  const started = await $.clock.now()
   try {
-    let r: Awaited<ReturnType<Engine['session']['compact']>>
     try {
-      r = await $.session.compact()
+      const r = await $.session.compact()
+      if (r.skip !== undefined) {
+        await logLine($, `compact: skipped: ${r.skip}`).catch(() => undefined)
+        $.ui.toast(`pitwall: compaction skipped: ${r.skip}`)
+      }
+      return
     } catch (err) {
-      // Rejected (a turn still running, or the host refusing a plugin's compact):
-      // say why, and leave /compact in the prompt box so one Enter does it.
-      const why = String(err instanceof Error ? err.message : err).slice(0, 200)
-      await logLine($, `compact: rejected: ${why}`).catch(() => undefined)
-      await $.prompt.fill({ text: '/compact' }).catch(() => undefined)
-      $.ui.toast(`pitwall: couldn't compact from here (${why}). /compact is in the prompt box: press Enter.`, {
-        timeoutMs: 12_000,
-      })
+      await logLine($, `compact: direct call refused: ${reason(err)}`).catch(() => undefined)
+    }
+    try {
+      await $.command.run({ command: 'compact' })
+      await logLine($, 'compact: ran /compact').catch(() => undefined)
       return
+    } catch (err) {
+      await logLine($, `compact: /compact refused: ${reason(err)}`).catch(() => undefined)
     }
-    if (r.skip !== undefined) {
-      await logLine($, `compact: skipped: ${r.skip}`).catch(() => undefined)
-      $.ui.toast(`pitwall: compaction skipped: ${r.skip}`)
-      return
-    }
-    await logLine($, `compact: done, ${r.tokensBefore ?? '?'} -> ${r.tokensAfter ?? '?'} tokens`).catch(() => undefined)
-    const at = await $.clock.now()
-    await update($, lastAt, () => at)
-    warnedHot = false
-    // The context reading only moves with the next reply; the compaction's own count is current now.
-    const tokensAfter = r.tokensAfter
-    if (tokensAfter !== undefined) {
-      await update($, context, (c): Context | null =>
-        c === null ? null : { ...c, tokens: tokensAfter, percent: Math.min(100, Math.round((100 * tokensAfter) / c.limit)) },
-      )
-    } else {
-      await refreshContext($)
-    }
-    const after = (await read($, context))?.percent
-    cue('pitstop')
-    const fill = before !== undefined && after !== undefined ? ` Context ${before}% → ${after}% used.` : ''
-    $.ui.toast(`🔧 Pit stop complete: stationary ${((at - started) / 1000).toFixed(1)}s.${fill}`, { timeoutMs: 8000 })
+    await $.prompt.fill({ text: '/compact' }).catch(() => undefined)
+    $.ui.toast("🔧 Couldn't start the compaction from the pitwall: /compact is in the prompt box, press Enter.", {
+      timeoutMs: 12_000,
+    })
   } finally {
     await update($, busy, (): Busy => null)
   }
@@ -770,15 +769,46 @@ export const register: Register = on => {
   on('command.run', { command: 'pitwall-notify' }, async $ => ({ text: await toggleNotify($) }))
   on('command.run', { command: 'self-commit' }, async $ => ({ text: await doSelfCommit($) }))
 
-  // Safety car: save a handoff before Claude Code auto-compacts the main conversation.
-  // Compaction always goes on, whatever happens to the handoff.
+  // Every compaction of the main conversation, however it started (Compact, a typed
+  // /compact, auto-compact): a Safety car handoff before an auto one, then the result.
+  // Compaction always goes on, whatever happens here.
   on('session.compact', async ($, e, next) => {
-    if (e.trigger === 'auto' && e.agentId === undefined) {
+    const isMain = e.agentId === undefined && e.trigger !== 'precompute'
+    if (e.trigger === 'auto' && isMain) {
       $.ui.toast('🚗 Safety car: auto-compact coming. Saving a Handoff first.', { timeoutMs: 8000 })
-      const said = await doHandoff($).catch(err => `Handoff failed: ${String(err)}`)
+      const said = await doHandoff($).catch(err => `Handoff failed: ${reason(err)}`)
       await notify($, '🚗 Safety car', `Auto-compact: ${said}`)
     }
-    return next(e)
+    const before = (await read($, context))?.percent
+    const started = await $.clock.now()
+    if (isMain) {
+      await update($, isCompacting, () => true)
+      await update($, form, (): Form => null)
+    }
+    let r: Awaited<ReturnType<typeof next>>
+    try {
+      r = await next(e)
+    } finally {
+      if (isMain) await update($, isCompacting, () => false)
+    }
+    if (!isMain || r.skip !== undefined) return r
+
+    const at = await $.clock.now()
+    await logLine($, `compact (${e.trigger}): ${r.tokensBefore ?? '?'} -> ${r.tokensAfter ?? '?'} tokens`).catch(() => undefined)
+    await update($, lastAt, () => at)
+    warnedHot = false
+    // The context reading only moves with the next reply; the compaction's own count is current now.
+    const tokensAfter = r.tokensAfter
+    if (tokensAfter !== undefined) {
+      await update($, context, (c): Context | null =>
+        c === null ? null : { ...c, tokens: tokensAfter, percent: Math.min(100, Math.round((100 * tokensAfter) / c.limit)) },
+      )
+    }
+    const after = (await read($, context))?.percent
+    cue('pitstop')
+    const fill = before !== undefined && after !== undefined ? ` Context ${before}% → ${after}% used.` : ''
+    $.ui.toast(`🔧 Pit stop complete: stationary ${((at - started) / 1000).toFixed(1)}s.${fill}`, { timeoutMs: 8000 })
+    return r
   }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
@@ -892,6 +922,7 @@ export const register: Register = on => {
     const openForm_ = await read($, form)
     const shown = await read($, explained)
     const note = await read($, resumeNote)
+    const compacting = await read($, isCompacting)
     const Markdown = els.Markdown
     const isWorking = e.props.isWorking
 
@@ -1031,7 +1062,12 @@ export const register: Register = on => {
 
     const handoffLabel =
       doing === 'handoff' ? 'Writing handoff…' : hLevel === 'hot' ? '📋 Handoff now' : '📋 Handoff'
-    const compactLabel = doing === 'compact' ? 'Compacting…' : xLevel === 'hot' ? '🔧 Compact now' : '🔧 Compact'
+    // In the pits: the compact button started one, or one is running (typed /compact, auto-compact).
+    const isPitting = doing === 'compact' || compacting
+    const isLocked = doing !== null || compacting
+    const compactLabel = isPitting ? 'Compacting…' : xLevel === 'hot' ? '🔧 Compact now' : '🔧 Compact'
+    // The confirm card on show: none while in the pits.
+    const card = isPitting ? null : openForm_
     const awtyLabel = doing === 'awty' ? 'Calling the pit wall…' : 'Radio check'
     const commitLabel = doing === 'commit' ? 'Checking repos…' : 'Self commit'
     const eli5Label = doing === 'eli5' ? 'Simplifying…' : 'ELI5'
@@ -1229,42 +1265,43 @@ export const register: Register = on => {
               : `📻 Box, box! Cache expires in ${clockText(left)} with context ${pct}% full. Handoff or Compact now.`}
           </Text>
         )}
+        {isPitting && <Text color="warning">🔧 In the pits: compacting the conversation. The pitwall's buttons are back once it's done.</Text>}
         <Box flexDirection="row" columnGap={3} rowGap={1} flexWrap="wrap" alignItems="center">
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Text color={THEME[hLevel]}>{doing === 'handoff' ? '◌' : '●'}</Text>
             <Button
               key="handoff"
               label={handoffLabel}
-              dimColor={doing !== null}
-              variant={hLevel === 'hot' && doing === null ? 'primary' : undefined}
+              dimColor={isLocked}
+              variant={hLevel === 'hot' && !isLocked ? 'primary' : undefined}
               onPress={() => void openForm($, 'handoff')}
             />
           </Box>
           <Box flexDirection="row" alignItems="center" gap={1}>
-            <Text color={THEME[xLevel]}>{doing === 'compact' ? '◌' : '●'}</Text>
+            <Text color={THEME[xLevel]}>{isPitting ? '◌' : '●'}</Text>
             <Button
               key="compact"
               label={compactLabel}
-              dimColor={doing !== null}
-              variant={xLevel === 'hot' && doing === null ? 'primary' : undefined}
+              dimColor={isLocked}
+              variant={xLevel === 'hot' && !isLocked ? 'primary' : undefined}
               onPress={() => void openForm($, 'compact')}
             />
           </Box>
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Text color="success">{doing === 'commit' ? '◌' : '✅'}</Text>
-            <Button key="self-commit" label={commitLabel} dimColor={doing !== null} onPress={() => void openForm($, 'commit')} />
+            <Button key="self-commit" label={commitLabel} dimColor={isLocked} onPress={() => void openForm($, 'commit')} />
           </Box>
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Text color={RED}>🔥</Text>
-            <Button key="grill" label="Grill me" onPress={() => void openForm($, 'grill')} />
+            <Button key="grill" label="Grill me" dimColor={compacting || doing === 'compact'} onPress={() => void openForm($, 'grill')} />
           </Box>
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Text color="suggestion">{doing === 'eli5' ? '◌' : '🧒'}</Text>
-            <Button key="eli5" label={eli5Label} dimColor={doing !== null} onPress={() => void openForm($, 'eli5')} />
+            <Button key="eli5" label={eli5Label} dimColor={isLocked} onPress={() => void openForm($, 'eli5')} />
           </Box>
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Text color={RED}>{doing === 'awty' ? '◌' : '📻'}</Text>
-            <Button key="awty" label={awtyLabel} dimColor={doing !== null} onPress={() => void openForm($, 'radio')} />
+            <Button key="awty" label={awtyLabel} dimColor={isLocked} onPress={() => void openForm($, 'radio')} />
           </Box>
           {resume !== null && (
             <Box flexDirection="row" alignItems="center" gap={1}>
@@ -1272,6 +1309,7 @@ export const register: Register = on => {
               <Button
                 key="resume"
                 label="Resume from last handoff"
+                dimColor={isPitting}
                 onPress={() => void doResume($)}
               />
             </Box>
@@ -1295,7 +1333,7 @@ export const register: Register = on => {
             />
           )}
         </Box>
-        {openForm_ === 'handoff' &&
+        {card === 'handoff' &&
           doing !== 'handoff' &&
           confirm(
             'handoff',
@@ -1306,21 +1344,21 @@ export const register: Register = on => {
               <Button key="handoff-focus" label="✏️ With a focus…" onPress={() => void typeInPrompt($, '/handoff')} />,
             ],
           )}
-        {openForm_ === 'compact' &&
+        {card === 'compact' &&
           confirm(
             'compact',
             `🔧 Compact the conversation now${c === null ? '' : ` (context ${pct}% used)`}? Claude summarizes it to free up room; ` +
               'detail from earlier turns may be lost, so Handoff first if you want to keep it.',
             [<Button key="compact-go" variant="primary" label="🔧 Compact now" onPress={() => void runForm($, () => doCompact($))} />],
           )}
-        {openForm_ === 'commit' &&
+        {card === 'commit' &&
           confirm(
             'commit',
             '✅ Check your repo(s) for uncommitted changes and ask Claude, in the chat, for a commit message per repo? ' +
               'Claude will not commit; it notes that you committed everything so far.',
             [<Button key="commit-go" variant="primary" label="✅ Check repos and ask" onPress={() => void runForm($, () => doSelfCommit($))} />],
           )}
-        {openForm_ === 'grill' &&
+        {card === 'grill' &&
           confirm('grill', '🔥 Have Claude interview you, round by round, until the plan holds up?', [
             <Button
               key="grill-start"
@@ -1330,12 +1368,12 @@ export const register: Register = on => {
             />,
             <Button key="grill-topic" label="✏️ Pick a topic…" onPress={() => void typeInPrompt($, '/mattpocock-skills:grilling')} />,
           ])}
-        {openForm_ === 'eli5' &&
+        {card === 'eli5' &&
           confirm('eli5', "🧒 Explain like you're 5: plain words, an analogy and a tiny example. Which one?", [
             <Button key="eli5-last" label="🧒 Explain the last answer" onPress={() => void runForm($, () => doEli5($, 'last'))} />,
             <Button key="eli5-session" label="🗺️ Explain where we are" onPress={() => void runForm($, () => doEli5($, 'session'))} />,
           ])}
-        {openForm_ === 'radio' &&
+        {card === 'radio' &&
           confirm('radio', '📻 Ask the pit wall where we stand? You get progress toward the goal, a one-line status and 3 questions to ask next.', [
             <Button key="radio-go" variant="primary" label="📻 Radio check" onPress={() => void runForm($, () => doAwty($))} />,
           ])}
