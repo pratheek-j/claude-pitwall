@@ -257,3 +257,26 @@ test('Every action button opens a confirm card first; Cancel runs nothing', asyn
   expect(await ui.find({ key: 'resume-text' })).toBeUndefined()
   await ui.unmount()
 })
+
+test('A compact the host refuses says why and leaves /compact in the prompt box', async ($, on) => {
+  world(on, {})
+  const filled: string[] = []
+  const toasts: string[] = []
+  on('prompt.fill', ($, e) => {
+    filled.push(e.text)
+    return { isFilled: true }
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  // Nothing beneath answers session.compact here, so the call rejects, as it does mid-turn.
+
+  const ui = await $.ui.mount({ plugin: 'pitwall', surface: 'desktop', ...BAND })
+  await ui.press({ key: 'compact' })
+  await ui.press({ key: 'compact-go' })
+  await ui.unmount()
+
+  expect(filled).toEqual(['/compact'])
+  expect(toasts.some(t => t.startsWith("pitwall: couldn't compact from here") && t.includes('press Enter'))).toBe(true)
+})

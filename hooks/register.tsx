@@ -252,14 +252,15 @@ async function pickPlayer($: Engine) {
       .run([bin, '--version'], { timeoutMs: 2000 })
       .then(
         r => r.exitCode === 0,
-        err => logSound($, `probe ${bin}: ${String(err).slice(0, 200)}`).then(() => false),
+        err => logLine($, `probe ${bin}: ${String(err).slice(0, 200)}`).then(() => false),
       )
     if (ok) return bin
   }
   return 'engine'
 }
 
-const SOUND_LOG = '/tmp/pitwall-sound.log'
+// What pitwall did and why, for when something looks like it did nothing.
+const LOG = '/tmp/pitwall.log'
 // Clips sound 30% as loud as the system's current volume. Loudness halves every
 // 10 dB, so 30% is a -17.4 dB gain: 0.135 in amplitude, and 51% on PulseAudio's
 // cubic volume scale.
@@ -267,10 +268,10 @@ const LOUDNESS = 0.3
 const GAIN = 10 ** ((10 * Math.log2(LOUDNESS)) / 20)
 const PULSE_VOLUME = Math.round(65536 * Math.cbrt(GAIN))
 
-async function logSound($: Engine, line: string) {
+async function logLine($: Engine, line: string) {
   const at = new Date(await $.clock.now()).toISOString()
-  const before = (await $.fs.exists(SOUND_LOG)) ? String(await $.fs.read(SOUND_LOG)) : ''
-  await $.fs.write(SOUND_LOG, `${before}${at} ${line}\n`.slice(-20_000))
+  const before = (await $.fs.exists(LOG)) ? String(await $.fs.read(LOG)) : ''
+  await $.fs.write(LOG, `${before}${at} ${line}\n`.slice(-20_000))
 }
 
 // Plays one clip now; says what happened, so a silent failure is never silent.
@@ -280,7 +281,7 @@ async function play($: Engine, name: Cue): Promise<string> {
     const file = `sounds/${name}.wav`
     if (player === 'engine') {
       await $.audio.play({ asset: file }, { gain: GAIN })
-      await logSound($, `${name}: $.audio.play resolved`)
+      await logLine($, `${name}: $.audio.play resolved`)
       return 'ok'
     }
     const path = `${$.plugin.root}/${file}`
@@ -293,11 +294,11 @@ async function play($: Engine, name: Cue): Promise<string> {
           : [player, path]
     const r = await $.process.run(argv, { timeoutMs: 15_000 })
     const said = `${name}: ${player} exit ${r.exitCode}${r.stderr ? ` stderr: ${r.stderr.trim().slice(0, 300)}` : ''}`
-    await logSound($, said)
+    await logLine($, said)
     return r.exitCode === 0 ? 'ok' : said
   } catch (err) {
     const said = `${name}: ${player ?? 'no player'} failed: ${String(err).slice(0, 300)}`
-    await logSound($, said).catch(() => undefined)
+    await logLine($, said).catch(() => undefined)
     return said
   }
 }
@@ -522,22 +523,44 @@ async function doCompact($: Engine) {
   const before = (await read($, context))?.percent
   const started = await $.clock.now()
   try {
-    const r = await $.session.compact()
-    if ('skip' in r && typeof r.skip === 'string') {
+    let r: Awaited<ReturnType<Engine['session']['compact']>>
+    try {
+      r = await $.session.compact()
+    } catch (err) {
+      // Rejected (a turn still running, or the host refusing a plugin's compact):
+      // say why, and leave /compact in the prompt box so one Enter does it.
+      const why = String(err instanceof Error ? err.message : err).slice(0, 200)
+      await logLine($, `compact: rejected: ${why}`).catch(() => undefined)
+      await $.prompt.fill({ text: '/compact' }).catch(() => undefined)
+      $.ui.toast(`pitwall: couldn't compact from here (${why}). /compact is in the prompt box: press Enter.`, {
+        timeoutMs: 12_000,
+      })
+      return
+    }
+    if (r.skip !== undefined) {
+      await logLine($, `compact: skipped: ${r.skip}`).catch(() => undefined)
       $.ui.toast(`pitwall: compaction skipped: ${r.skip}`)
       return
     }
+    await logLine($, `compact: done, ${r.tokensBefore ?? '?'} -> ${r.tokensAfter ?? '?'} tokens`).catch(() => undefined)
     const at = await $.clock.now()
     await update($, lastAt, () => at)
     warnedHot = false
-    await refreshContext($)
+    // The context reading only moves with the next reply; the compaction's own count is current now.
+    const tokensAfter = r.tokensAfter
+    if (tokensAfter !== undefined) {
+      await update($, context, (c): Context | null =>
+        c === null ? null : { ...c, tokens: tokensAfter, percent: Math.min(100, Math.round((100 * tokensAfter) / c.limit)) },
+      )
+    } else {
+      await refreshContext($)
+    }
     const after = (await read($, context))?.percent
     cue('pitstop')
     const fill = before !== undefined && after !== undefined ? ` Context ${before}% → ${after}% used.` : ''
     $.ui.toast(`🔧 Pit stop complete: stationary ${((at - started) / 1000).toFixed(1)}s.${fill}`, { timeoutMs: 8000 })
   } finally {
     await update($, busy, (): Busy => null)
-    await refreshContext($)
   }
 }
 
