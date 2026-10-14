@@ -837,10 +837,7 @@ export const register: Register = on => {
         lastMs: lap,
         bestMs: l.bestMs === null ? lap : Math.min(l.bestMs, lap),
       }))
-      if (lap >= 45_000) {
-        cue('flyby')
-        void notify($, `🏁 Lap ${(await read($, laps)).count} done`, `That turn took ${lapText(lap)}.`)
-      }
+      if (lap >= 45_000) cue('flyby')
     }
 
     if (usage !== undefined) {
